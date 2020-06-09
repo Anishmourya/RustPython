@@ -179,7 +179,7 @@ impl PyDictRef {
     }
 
     #[pymethod(magic)]
-    fn len(self) -> usize {
+    pub fn len(self) -> usize {
         self.entries.len()
     }
 
@@ -530,6 +530,11 @@ impl Iterator for DictIter {
             Some((key, value)) => Some((key, value)),
             None => None,
         }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let l = self.dict.entries.len_from_entry_index(self.position);
+        (l, Some(l))
     }
 }
 
