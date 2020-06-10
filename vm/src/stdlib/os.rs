@@ -124,7 +124,7 @@ enum OutputMode {
 fn output_by_mode(val: String, mode: OutputMode, vm: &VirtualMachine) -> PyObjectRef {
     match mode {
         OutputMode::String => vm.ctx.new_str(val),
-        OutputMode::Bytes => vm.ctx.new_bytes(val.as_bytes().to_vec()),
+        OutputMode::Bytes => vm.ctx.new_bytes(val.into_bytes()),
     }
 }
 
@@ -139,6 +139,9 @@ impl PyPathLike {
             path: ffi::OsString::from(path),
             mode: OutputMode::String,
         }
+    }
+    pub fn into_os_string(self) -> ffi::OsString {
+        self.path
     }
 }
 
@@ -1025,6 +1028,19 @@ fn os_get_inheritable(fd: RawFd, vm: &VirtualMachine) -> PyResult<bool> {
     }
 }
 
+#[cfg(unix)]
+pub(crate) fn set_inheritable(fd: RawFd, inheritable: bool) -> nix::Result<()> {
+    use nix::fcntl;
+
+    let flags = fcntl::FdFlag::from_bits_truncate(fcntl::fcntl(fd, fcntl::FcntlArg::F_GETFD)?);
+    let mut new_flags = flags;
+    new_flags.set(fcntl::FdFlag::FD_CLOEXEC, !inheritable);
+    if flags != new_flags {
+        fcntl::fcntl(fd, fcntl::FcntlArg::F_SETFD(new_flags))?;
+    }
+    Ok(())
+}
+
 fn os_set_inheritable(fd: i64, inheritable: bool, vm: &VirtualMachine) -> PyResult<()> {
     #[cfg(not(any(unix, windows)))]
     {
@@ -1032,21 +1048,7 @@ fn os_set_inheritable(fd: i64, inheritable: bool, vm: &VirtualMachine) -> PyResu
     }
     #[cfg(unix)]
     {
-        let fd = fd as RawFd;
-        let _set_flag = || {
-            use nix::fcntl::fcntl;
-            use nix::fcntl::FcntlArg;
-            use nix::fcntl::FdFlag;
-
-            let flags = FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD)?);
-            let mut new_flags = flags;
-            new_flags.set(FdFlag::from_bits_truncate(libc::FD_CLOEXEC), !inheritable);
-            if flags != new_flags {
-                fcntl(fd, FcntlArg::F_SETFD(new_flags))?;
-            }
-            Ok(())
-        };
-        _set_flag().or_else(|err| Err(convert_nix_error(vm, err)))
+        set_inheritable(fd as RawFd, inheritable).map_err(|err| convert_nix_error(vm, err))
     }
     #[cfg(windows)]
     {
@@ -1795,6 +1797,13 @@ fn os_wait(vm: &VirtualMachine) -> PyResult<(libc::pid_t, i32)> {
     os_waitpid(-1, 0, vm)
 }
 
+#[cfg(unix)]
+fn os_strerror(e: i32) -> String {
+    unsafe { ffi::CStr::from_ptr(libc::strerror(e)) }
+        .to_string_lossy()
+        .into_owned()
+}
+
 pub fn make_module(vm: &VirtualMachine) -> PyObjectRef {
     let ctx = &vm.ctx;
 
@@ -1904,6 +1913,7 @@ pub fn make_module(vm: &VirtualMachine) -> PyObjectRef {
         "lseek" => ctx.new_function(os_lseek),
         "set_inheritable" => ctx.new_function(os_set_inheritable),
         "link" => ctx.new_function(os_link),
+        "strerror" => ctx.new_function(os_strerror),
 
         "O_RDONLY" => ctx.new_int(libc::O_RDONLY),
         "O_WRONLY" => ctx.new_int(libc::O_WRONLY),
