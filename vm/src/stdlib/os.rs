@@ -1801,7 +1801,7 @@ fn os_wexitstatus(status: i32) -> i32 {
 fn os_waitpid(pid: libc::pid_t, opt: i32, vm: &VirtualMachine) -> PyResult<(libc::pid_t, i32)> {
     let mut status = 0;
     let pid = unsafe { libc::waitpid(pid, &mut status, opt) };
-    let pid = Errno::result(pid).map_err(|e| convert_nix_error(vm, e.into()))?;
+    let pid = Errno::result(pid).map_err(|e| convert_nix_error(vm, e))?;
     Ok((pid, status))
 }
 #[cfg(unix)]
