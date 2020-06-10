@@ -1,9 +1,7 @@
-use std::convert::TryFrom;
 use std::ffi;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::io::{self, ErrorKind, Read, Write};
-use std::mem::MaybeUninit;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 #[cfg(windows)]
@@ -38,11 +36,12 @@ use crate::obj::objstr::{PyString, PyStringRef};
 use crate::obj::objtuple::PyTupleRef;
 use crate::obj::objtype::PyClassRef;
 use crate::pyobject::{
-    Either, ItemProtocol, PyClassImpl, PyIterable, PyObjectRef, PyRef, PyResult, PyValue,
-    TryFromObject, TypeProtocol,
+    Either, ItemProtocol, PyClassImpl, PyObjectRef, PyRef, PyResult, PyValue, TryFromObject,
+    TypeProtocol,
 };
 use crate::vm::VirtualMachine;
 
+// just to avoid unused import warnings
 // cfg from nix
 #[cfg(any(
     target_os = "android",
@@ -51,6 +50,8 @@ use crate::vm::VirtualMachine;
     target_os = "openbsd"
 ))]
 use crate::pyobject::PyIterable;
+#[cfg(unix)]
+use std::convert::TryFrom;
 
 #[cfg(windows)]
 pub const MODULE_NAME: &str = "nt";
@@ -142,6 +143,11 @@ impl PyPathLike {
     }
     pub fn into_os_string(self) -> ffi::OsString {
         self.path
+    }
+    #[cfg(windows)]
+    pub fn wide(&self) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
+        self.path.encode_wide().chain(std::iter::once(0)).collect()
     }
 }
 
@@ -417,10 +423,8 @@ fn getgroups() -> nix::Result<Vec<Gid>> {
 }
 
 #[cfg(unix)]
-fn os_access(path: PyStringRef, mode: u8, vm: &VirtualMachine) -> PyResult<bool> {
+fn os_access(path: PyPathLike, mode: u8, vm: &VirtualMachine) -> PyResult<bool> {
     use std::os::unix::fs::MetadataExt;
-
-    let path = path.as_str();
 
     let flags = AccessFlags::from_bits(mode).ok_or_else(|| {
         vm.new_value_error(
@@ -429,7 +433,7 @@ fn os_access(path: PyStringRef, mode: u8, vm: &VirtualMachine) -> PyResult<bool>
         )
     })?;
 
-    let metadata = fs::metadata(path);
+    let metadata = fs::metadata(&path.path);
 
     // if it's only checking for F_OK
     if flags == AccessFlags::F_OK {
@@ -450,6 +454,19 @@ fn os_access(path: PyStringRef, mode: u8, vm: &VirtualMachine) -> PyResult<bool>
     let x_ok = !flags.contains(AccessFlags::X_OK) || perm.is_executable;
 
     Ok(r_ok && w_ok && x_ok)
+}
+#[cfg(windows)]
+fn os_access(path: PyPathLike, mode: u8) -> bool {
+    use winapi::um::{fileapi, winnt};
+    let attr = unsafe { fileapi::GetFileAttributesW(path.wide().as_ptr()) };
+    attr != fileapi::INVALID_FILE_ATTRIBUTES
+        && (mode & 2 == 0
+            || attr & winnt::FILE_ATTRIBUTE_READONLY == 0
+            || attr & winnt::FILE_ATTRIBUTE_DIRECTORY != 0)
+}
+#[cfg(not(any(unix, windows)))]
+fn os_access(path: PyStringRef, mode: u8, vm: &VirtualMachine) -> PyResult<bool> {
+    unimplemented!()
 }
 
 fn os_error(message: OptionalArg<PyStringRef>, vm: &VirtualMachine) -> PyResult {
@@ -1599,6 +1616,7 @@ fn envp_from_dict(dict: PyDictRef, vm: &VirtualMachine) -> PyResult<Vec<ffi::CSt
         .collect()
 }
 
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "macos"))]
 #[derive(FromArgs)]
 struct PosixSpawnArgs {
     #[pyarg(positional_only)]
@@ -1630,7 +1648,7 @@ impl PosixSpawnArgs {
             .map_err(|_| vm.new_value_error("path should not have nul bytes".to_owned()))?;
 
         let mut file_actions = unsafe {
-            let mut fa = MaybeUninit::uninit();
+            let mut fa = std::mem::MaybeUninit::uninit();
             assert!(libc::posix_spawn_file_actions_init(fa.as_mut_ptr()) == 0);
             fa.assume_init()
         };
@@ -1682,7 +1700,7 @@ impl PosixSpawnArgs {
         }
 
         let mut attrp = unsafe {
-            let mut sa = MaybeUninit::uninit();
+            let mut sa = std::mem::MaybeUninit::uninit();
             assert!(libc::posix_spawnattr_init(sa.as_mut_ptr()) == 0);
             sa.assume_init()
         };
@@ -1797,7 +1815,6 @@ fn os_wait(vm: &VirtualMachine) -> PyResult<(libc::pid_t, i32)> {
     os_waitpid(-1, 0, vm)
 }
 
-#[cfg(unix)]
 fn os_strerror(e: i32) -> String {
     unsafe { ffi::CStr::from_ptr(libc::strerror(e)) }
         .to_string_lossy()
@@ -1855,7 +1872,7 @@ pub fn make_module(vm: &VirtualMachine) -> PyObjectRef {
     #[allow(unused_mut)]
     let mut support_funcs = vec![
         SupportFunc::new(vm, "open", os_open, None, Some(false), None),
-        // access Some Some None
+        SupportFunc::new(vm, "access", os_access, Some(false), Some(false), None),
         SupportFunc::new(vm, "chdir", os_chdir, Some(false), None, None),
         // chflags Some, None Some
         // chown Some Some Some
@@ -1972,7 +1989,6 @@ fn extend_module_platform_specific(vm: &VirtualMachine, module: &PyObjectRef) {
     let uname_result = UnameResult::make_class(ctx);
 
     extend_module!(vm, module, {
-        "access" => ctx.new_function(os_access),
         "chmod" => ctx.new_function(os_chmod),
         "get_inheritable" => ctx.new_function(os_get_inheritable), // TODO: windows
         "get_blocking" => ctx.new_function(os_get_blocking),
